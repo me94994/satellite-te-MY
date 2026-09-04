@@ -26,7 +26,8 @@ from .sequence_schema import EdgeKey, FlowKey, PathKey, Snapshot, load_dataset, 
 BackendName = Literal["gurobi", "scipy"]
 SolveMode = Literal[
     "cold_rebuild", "reuse_model", "reuse_model_auto", "explicit_basis",
-    "explicit_basis_presolve", "reset_basis",
+    "explicit_basis_presolve", "reset_basis", "transported_pstart",
+    "transported_pstart_dstart", "zero_start",
 ]
 
 
@@ -44,6 +45,16 @@ class CapacityPolicy:
     def __post_init__(self) -> None:
         if self.network_edge_capacity <= 0 or self.path_only_edge_capacity <= 0:
             raise ValueError("Capacity defaults must be strictly positive")
+
+
+@dataclass(frozen=True)
+class AdvancedStart:
+    """Complete semantic vectors submitted through Gurobi PStart/DStart."""
+
+    path_flow: Mapping[PathKey, float]
+    capacity_dual: Mapping[EdgeKey, float] | None = None
+    demand_dual: Mapping[FlowKey, float] | None = None
+    availability_dual: Mapping[PathKey, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +122,7 @@ class SolveState:
     raw_capacity_pi: dict[EdgeKey, float]
     congestion_price: dict[EdgeKey, float]
     raw_demand_pi: dict[FlowKey, float]
+    raw_availability_pi: dict[PathKey, float]
     reduced_cost: dict[PathKey, float]
     reduced_cost_convention: str
     binding_capacity: dict[EdgeKey, bool]
@@ -123,7 +135,7 @@ class SolveState:
         excluded = {
             "path_flow", "edge_load", "edge_capacity", "edge_utilization",
             "raw_capacity_pi", "congestion_price", "raw_demand_pi",
-            "reduced_cost", "binding_capacity",
+            "raw_availability_pi", "reduced_cost", "binding_capacity",
         }
         return {key: value for key, value in asdict(self).items() if key not in excluded}
 
@@ -140,6 +152,7 @@ class SolveState:
                 "raw_capacity_pi": [[u, v, value] for (u, v), value in sorted(self.raw_capacity_pi.items())],
                 "congestion_price": [[u, v, value] for (u, v), value in sorted(self.congestion_price.items())],
                 "raw_demand_pi": [[s, d, value] for (s, d), value in sorted(self.raw_demand_pi.items())],
+                "raw_availability_pi": [[p[0], p[1], list(p[2]), value] for p, value in sorted(self.raw_availability_pi.items())],
                 "reduced_cost": [[p[0], p[1], list(p[2]), value] for p, value in sorted(self.reduced_cost.items())],
                 "binding_capacity": [[u, v, value] for (u, v), value in sorted(self.binding_capacity.items())],
             }
@@ -347,10 +360,15 @@ class GurobiSequentialLP:
         self.model.update()
         return time.perf_counter() - start, capacities
 
-    def solve(self, snapshot: Snapshot, mode: SolveMode) -> SolveState:
+    def solve(
+        self, snapshot: Snapshot, mode: SolveMode,
+        *, advanced_start: AdvancedStart | None = None,
+    ) -> SolveState:
         gp = self.gp
         total_start = time.perf_counter()
         had_previous_solution = self.model is not None
+        if mode in {"transported_pstart", "transported_pstart_dstart", "zero_start"} and not had_previous_solution:
+            raise ValueError(f"{mode} requires solving the previous pair-universe state first")
         if mode == "cold_rebuild" or self.model is None:
             if mode == "cold_rebuild" and self.model is not None:
                 # A cold solve must not retain a previous model or basis.
@@ -375,6 +393,31 @@ class GurobiSequentialLP:
             elif mode == "reset_basis":
                 # reset(0) discards solution/basis state while preserving the model.
                 self.model.reset(0)
+            elif mode in {"transported_pstart", "transported_pstart_dstart", "zero_start"}:
+                if advanced_start is None:
+                    raise ValueError(f"{mode} requires a complete AdvancedStart")
+                # Remove the retained basis first, otherwise it would dominate
+                # the vectors and invalidate the transported-start comparison.
+                self.model.reset(0)
+                self.model.Params.LPWarmStart = 2
+                self.model.setAttr(
+                    "PStart", self.variables,
+                    [float(advanced_start.path_flow.get(path, 0.0)) for path in self.universe.paths],
+                )
+                if mode in {"transported_pstart_dstart", "zero_start"}:
+                    if any(value is None for value in (
+                        advanced_start.capacity_dual, advanced_start.demand_dual,
+                        advanced_start.availability_dual,
+                    )):
+                        raise ValueError(f"{mode} requires DStart values for every constraint")
+                    dual_values = (
+                        [float(advanced_start.capacity_dual.get(edge, 0.0)) for edge in self.universe.edges]
+                        + [float(advanced_start.demand_dual.get(flow, 0.0)) for flow in self.universe.flows]
+                        + [float(advanced_start.availability_dual.get(path, 0.0)) for path in self.universe.paths]
+                    )
+                    all_constraints = self.capacity_constraints + self.demand_constraints + self.availability_constraints
+                    self.model.setAttr("DStart", all_constraints, dual_values)
+                self.model.update()
         if self.model is None:
             raise RuntimeError("Gurobi model construction failed")
         optimize_start = time.perf_counter()
@@ -399,6 +442,12 @@ class GurobiSequentialLP:
         elif mode == "reset_basis":
             api = "MODEL_RESET_0_AFTER_RHS_UPDATE"
             effective = False
+        elif mode == "transported_pstart":
+            api = "PSTART_LPWARMSTART_2_DUAL_SIMPLEX_PSTART_NOT_PRIORITIZED"
+            effective = False
+        elif mode in {"transported_pstart_dstart", "zero_start"}:
+            api = "COMPLETE_PSTART_DSTART_LPWARMSTART_2_AFTER_MODEL_RESET"
+            effective = True
         else:
             api = "NEW_MODEL_EACH_SNAPSHOT"
             effective = False
@@ -500,6 +549,7 @@ def _assemble_state(
         edge_utilization=utilization, raw_capacity_pi=cap_pi_map,
         congestion_price=price,
         raw_demand_pi={flow: float(raw_demand_pi[i]) for i, flow in enumerate(universe.flows)},
+        raw_availability_pi={path: float(raw_availability_pi[i]) for i, path in enumerate(universe.paths)},
         reduced_cost={path: float(reduced_cost[i]) for i, path in enumerate(universe.paths)},
         reduced_cost_convention=reduced_cost_convention,
         binding_capacity=binding, dual_sign_multiplier=dual_sign,
