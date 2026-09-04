@@ -23,25 +23,23 @@ def jaccard(left: set[KeyT] | frozenset[KeyT], right: set[KeyT] | frozenset[KeyT
 
 
 def normalized_l1(left: Mapping[KeyT, float], right: Mapping[KeyT, float], keys: Sequence[KeyT] | None = None) -> float:
-    """Symmetric L1 drift normalized by the larger vector mass."""
+    """Symmetric L1 drift normalized by the mean vector mass."""
 
     aligned = list(keys) if keys is not None else sorted(set(left).union(right), key=repr)
     numerator = sum(abs(float(left.get(key, 0.0)) - float(right.get(key, 0.0))) for key in aligned)
-    denominator = max(
-        sum(abs(float(left.get(key, 0.0))) for key in aligned),
-        sum(abs(float(right.get(key, 0.0))) for key in aligned),
-        1e-12,
-    )
+    left_mass = sum(abs(float(left.get(key, 0.0))) for key in aligned)
+    right_mass = sum(abs(float(right.get(key, 0.0))) for key in aligned)
+    denominator = max(0.5 * (left_mass + right_mass), 1e-12)
     return numerator / denominator
 
 
 def normalized_l2(left: Mapping[KeyT, float], right: Mapping[KeyT, float], keys: Sequence[KeyT] | None = None) -> float:
-    """Symmetric Euclidean drift normalized by the larger vector norm."""
+    """Symmetric Euclidean drift normalized by the mean vector norm."""
 
     aligned = list(keys) if keys is not None else sorted(set(left).union(right), key=repr)
     lv = np.asarray([float(left.get(key, 0.0)) for key in aligned], dtype=float)
     rv = np.asarray([float(right.get(key, 0.0)) for key in aligned], dtype=float)
-    denominator = max(float(np.linalg.norm(lv)), float(np.linalg.norm(rv)), 1e-12)
+    denominator = max(0.5 * (float(np.linalg.norm(lv)) + float(np.linalg.norm(rv))), 1e-12)
     return float(np.linalg.norm(lv - rv) / denominator)
 
 

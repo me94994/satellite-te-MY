@@ -4,6 +4,11 @@ This directory tests a narrow hypothesis: whether ordered adapter samples and th
 fixed-path LP optima are sufficiently continuous to justify later optimizer-state
 tracking. It does not train or modify SaTE, DeepLaDu, TELGEN, or any temporal GNN.
 
+The second-round real-data runner is intentionally restricted-license safe. It
+streams an official raw SaTE pickle volume, selects flows by the fixed
+`(-appearance_count, src, dst)` rule, keeps only edges actually used by those
+official candidate paths, and labels every result `real-data restricted slice`.
+
 ## Evidence boundary
 
 - Input is the adapter-produced list-of-dict pickle and is read in list order.
@@ -55,6 +60,24 @@ Unit tests (Gurobi-specific tests explicitly skip when unavailable):
 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
 python -m pytest -q experiments/temporal_feasibility/tests
 ```
+
+## Real restricted validation
+
+After placing one official raw volume under the ignored `input/raw/starlink/`
+tree, run all real stages serially with one command:
+
+```bash
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
+python -m experiments.temporal_feasibility.run_real_experiment \
+  --raw-path input/raw/starlink/DataSetForSaTE25/StarLink_DataSetForAgent25_5000_A.pkl \
+  --adapted-path input/raw/starlink/real_restricted_30x100.pkl \
+  --output-dir output/temporal_feasibility/real \
+  --intensity 25 --start-index 0 --limit 100 --max-flows 30
+```
+
+Use `--resume` only when the completed summary has the same start/limit/flow
+signature. The runner fails closed if Gurobi is unavailable or the selected
+universe exceeds the confirmed restricted-license limit.
 
 ## Fixed-topology real-data workflow
 
@@ -108,12 +131,14 @@ python -m experiments.temporal_feasibility.analyze_continuity \
   iterations, objective, dual objective, and feasibility/parity checks.
 - `state_records.jsonl`: semantic path flow, edge load/utilization, raw duals,
   calibrated nonnegative congestion prices, binding flags, and reduced costs.
-- `continuity_records.csv`: adjacent, lag 1/2/5/10, unrestricted random,
-  demand-matched random, and topology-matched random comparisons.
-- `transport_records.csv`: copy-persistent/drop-deleted transport with zero,
-  global-median, and neighbor-median initialization for new edges, compared with
-  default zero/one/deterministic-random vectors.
-- `summary.json` and `warm_start_summary.json`: distribution statistics,
+- `continuity_records.csv`: adjacent, lag 1/2/5/10/20, unrestricted random,
+  demand-matched, topology-matched, and jointly matched random comparisons.
+- `transport_records.csv`: load/utilization/binding/dual transport with edge
+  birth/death and no-history controls.
+- `counterfactual_records.csv`: z00/z01/z10/z11 traffic/topology decomposition.
+- `warm_start_records.csv`: cold, reuse, explicit basis, basis+presolve, and
+  reset-basis timing/iteration evidence.
+- `summary.json`: distribution statistics,
   bootstrap median intervals, provenance, limitations, and Gate-ready values.
 - `figures/*.png`: matplotlib-only plots.
 

@@ -15,6 +15,13 @@ from .sequence_schema import Snapshot, discover_datasets, load_dataset, numeric_
 MANIFEST_FIELDS = [
     "list_position",
     "data_idx",
+    "source_file",
+    "source_record_index",
+    "source_data_idx",
+    "intensity",
+    "adapter_mode",
+    "nominal_interval_s",
+    "source_timestamp",
     "edge_count",
     "graph_hash",
     "total_demand",
@@ -55,6 +62,13 @@ def inspect_snapshots(snapshots: list[Snapshot]) -> tuple[list[dict[str, Any]], 
             {
                 "list_position": snapshot.position,
                 "data_idx": snapshot.data_idx,
+                "source_file": snapshot.meta.get("source_file", ""),
+                "source_record_index": snapshot.meta.get("source_record_index", ""),
+                "source_data_idx": snapshot.meta.get("source_data_idx", ""),
+                "intensity": snapshot.meta.get("intensity", ""),
+                "adapter_mode": snapshot.meta.get("adapter_mode", ""),
+                "nominal_interval_s": snapshot.meta.get("nominal_interval_s", ""),
+                "source_timestamp": snapshot.meta.get("source_timestamp", ""),
                 "edge_count": len(snapshot.graph_edges),
                 "graph_hash": snapshot.graph_hash,
                 "total_demand": snapshot.total_demand,
@@ -72,6 +86,15 @@ def inspect_snapshots(snapshots: list[Snapshot]) -> tuple[list[dict[str, Any]], 
     graph_hashes = {snapshot.graph_hash for snapshot in snapshots}
     has_all_timestamps = all(snapshot.timestamp is not None for snapshot in snapshots)
     strictly_monotonic = not nonmonotonic_positions
+    source_indices = [snapshot.meta.get("source_record_index") for snapshot in snapshots]
+    source_files = {snapshot.meta.get("source_file") for snapshot in snapshots}
+    source_order_contiguous = all(
+        isinstance(value, int) and value == source_indices[0] + offset
+        for offset, value in enumerate(source_indices)
+    ) if source_indices and isinstance(source_indices[0], int) else False
+    provenance_complete = source_order_contiguous and len(source_files) == 1 and None not in source_files
+    interval_values = {snapshot.meta.get("nominal_interval_s") for snapshot in snapshots}
+    physical_time_supported = provenance_complete and None not in interval_values and "" not in interval_values
     summary = {
         "snapshot_count": len(snapshots),
         "data_idx_strictly_monotonic": strictly_monotonic,
@@ -81,6 +104,11 @@ def inspect_snapshots(snapshots: list[Snapshot]) -> tuple[list[dict[str, Any]], 
         "unique_graph_hash_count": len(graph_hashes),
         "fixed_topology_observed": len(graph_hashes) == 1,
         "timestamp_field_present_for_all": has_all_timestamps,
+        "source_record_order_contiguous": source_order_contiguous,
+        "single_source_file": len(source_files) == 1,
+        "physical_time_supported": physical_time_supported,
+        "gate_a": "PASS" if physical_time_supported else "PARTIAL" if provenance_complete else "FAIL",
+        "real_sequence_verdict": "TIME_SUPPORTED" if physical_time_supported else "ORDERED_ONLY" if provenance_complete else "FAILED",
         "source_keys": sorted({key for snapshot in snapshots for key in snapshot.source_keys}),
         "sequence_claim": (
             "PHYSICAL_TIME_METADATA_PRESENT_ORDER_STILL_REQUIRES_SOURCE_VALIDATION"
@@ -90,6 +118,7 @@ def inspect_snapshots(snapshots: list[Snapshot]) -> tuple[list[dict[str, Any]], 
         "intensity_or_volume_boundary_status": (
             "NOT_IDENTIFIABLE_FROM_SAMPLE_SCHEMA"
             if not any(key in {"intensity", "volume"} for key in snapshots[0].source_keys)
+            and not any(key in {"intensity", "volume"} for key in snapshots[0].meta)
             else "METADATA_PRESENT_REQUIRES_VALUE_LEVEL_REVIEW"
         ),
     }
@@ -127,6 +156,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset", help="Adapter-generated list-of-dict pickle")
     parser.add_argument("--search-root", default="input", help="Root used only when --dataset is omitted")
     parser.add_argument("--limit", type=int, default=500)
+    parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--output", required=True, help="Manifest CSV path")
     parser.add_argument("--list-datasets", action="store_true", help="Print discovered datasets and exit")
     return parser
@@ -139,7 +169,7 @@ def main() -> int:
             print(candidate)
         return 0
     dataset_path = resolve_dataset(args.dataset, args.search_root)
-    snapshots = load_dataset(dataset_path, limit=args.limit)
+    snapshots = load_dataset(dataset_path, limit=args.limit, start_index=args.start_index)
     rows, summary = inspect_snapshots(snapshots)
     summary["dataset"] = str(dataset_path)
     summary["evidence_source"] = "real_adapter_pickle"

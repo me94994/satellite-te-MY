@@ -24,7 +24,8 @@ from . import ShortestPath as ShP
 
 class StarlinkAdapter():
     
-    def __init__(self, input_path, topo_file_template, file_volume, data_per_topo, ism:ISM, parallel=None):
+    def __init__(self, input_path, topo_file_template, file_volume, data_per_topo, ism:ISM,
+                 parallel=None, start_index=0, limit=None, intensity=None):
         self.input_path = input_path
         self.input_topo_file_template = topo_file_template
         
@@ -33,6 +34,10 @@ class StarlinkAdapter():
         self.ism = ism
         
         self.parallel = parallel
+        # Optional bounded window keeps the original adapter behavior by default.
+        self.start_index = start_index
+        self.limit = limit
+        self.intensity = intensity
         
     def adapt(self, output_path):
         if os.path.exists(output_path):
@@ -43,14 +48,21 @@ class StarlinkAdapter():
         args = []
         for i in self.file_volume:
             file_path = os.path.join(self.input_path, self.input_topo_file_template.format(i))
-            args.append((file_path, self.data_per_topo, i, self.ism, output_path))
+            args.append((file_path, self.data_per_topo, i, self.ism, output_path,
+                         self.start_index, self.limit, self.intensity))
         
-        with mp.Pool(self.parallel) as pool:
-            pool.starmap(StarlinkAdapter._adapt_topo_file, args)
+        if self.parallel == 1:
+            # Serial execution avoids spawning a worker for bounded experiment slices.
+            for task in args:
+                StarlinkAdapter._adapt_topo_file(*task)
+        else:
+            with mp.Pool(self.parallel) as pool:
+                pool.starmap(StarlinkAdapter._adapt_topo_file, args)
         
         
     @staticmethod
-    def _adapt_topo_file(file_path, data_num, file_idx, ism, output_path):
+    def _adapt_topo_file(file_path, data_num, file_idx, ism, output_path,
+                         start_index=0, limit=None, intensity=None):
         # ========= Orbit Shell Parameters =========
         OrbitNum1 = 72
         SatNum1   = 22
@@ -90,7 +102,12 @@ class StarlinkAdapter():
 
         starlink_dataset = []
 
-        for k in tqdm(range(data_num)):
+        if start_index < 0 or (limit is not None and limit <= 0):
+            raise ValueError("start_index must be non-negative and limit must be positive")
+        for _ in range(start_index):
+            pickle.load(file)
+        stop_index = min(data_num, start_index + limit) if limit is not None else data_num
+        for k in tqdm(range(start_index, stop_index)):
             
             data = pickle.load(file)
 
@@ -197,7 +214,21 @@ class StarlinkAdapter():
             # else:
             #     break;
 
-            starlink_dataset.append({'graph': E, 'tm': tm_dict, 'path': path_dict, 'data_idx': data_idx})
+            starlink_dataset.append({
+                'graph': E,
+                'tm': tm_dict,
+                'path': path_dict,
+                'data_idx': data_idx,
+                'meta': {
+                    'source_file': os.path.basename(file_path),
+                    'source_record_index': k,
+                    'source_data_idx': None,
+                    'intensity': intensity,
+                    'adapter_mode': f'official_starlink_{ism.value}',
+                    'nominal_interval_s': None,
+                    'source_timestamp': None,
+                },
+            })
 
         file.close()
 

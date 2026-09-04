@@ -24,7 +24,10 @@ from scipy.optimize import linprog
 from .sequence_schema import EdgeKey, FlowKey, PathKey, Snapshot, load_dataset, path_edges_for_key
 
 BackendName = Literal["gurobi", "scipy"]
-SolveMode = Literal["cold_rebuild", "reuse_model", "explicit_basis", "reset_basis"]
+SolveMode = Literal[
+    "cold_rebuild", "reuse_model", "reuse_model_auto", "explicit_basis",
+    "explicit_basis_presolve", "reset_basis",
+]
 
 
 class SolverUnavailableError(RuntimeError):
@@ -86,6 +89,9 @@ class SolveState:
     solve_mode: str
     warm_start_api: str
     warm_start_effective: bool
+    method: int | None
+    presolve: int | None
+    lp_warm_start: int | None
     model_build_wall_time: float
     rhs_update_wall_time: float
     optimize_wall_time: float
@@ -233,6 +239,9 @@ class ScipySequentialLP:
             mode=mode,
             warm_start_api="NONE_SCIPY_HIGHS_REBUILDS_INTERNAL_MODEL",
             warm_start_effective=False,
+            method=1,
+            presolve=1,
+            lp_warm_start=None,
             model_build=model_build,
             rhs_update=rhs_update,
             optimize_wall=optimize_wall,
@@ -272,7 +281,14 @@ class GurobiSequentialLP:
         self.availability_constraints: list[Any] = []
         self.saved_basis: tuple[list[int], list[int]] | None = None
 
-    def _build(self, snapshot: Snapshot) -> float:
+    def close(self) -> None:
+        """Release the native model promptly after a benchmark mode finishes."""
+
+        if self.model is not None:
+            self.model.dispose()
+            self.model = None
+
+    def _build(self, snapshot: Snapshot, mode: SolveMode) -> float:
         gp = self.gp
         start = time.perf_counter()
         model = gp.Model("temporal_fixed_path_total_flow")
@@ -280,6 +296,11 @@ class GurobiSequentialLP:
         model.Params.Threads = 1
         model.Params.Method = 1  # Deterministic dual simplex.
         model.Params.Seed = 42
+        # LPWarmStart=2 explicitly enables presolve mapping for supplied bases.
+        if mode == "explicit_basis_presolve":
+            model.Params.LPWarmStart = 2
+        elif mode == "explicit_basis":
+            model.Params.LPWarmStart = 1
         variables = [
             model.addVar(lb=0.0, vtype=gp.GRB.CONTINUOUS, name=f"x[{i}]")
             for i in range(len(self.universe.paths))
@@ -331,7 +352,11 @@ class GurobiSequentialLP:
         total_start = time.perf_counter()
         had_previous_solution = self.model is not None
         if mode == "cold_rebuild" or self.model is None:
-            model_build = self._build(snapshot)
+            if mode == "cold_rebuild" and self.model is not None:
+                # A cold solve must not retain a previous model or basis.
+                self.model.dispose()
+                self.model = None
+            model_build = self._build(snapshot, mode)
             rhs_update = 0.0
             capacities = capacities_for_snapshot(snapshot, self.universe, self.policy)
             restored = False
@@ -340,7 +365,7 @@ class GurobiSequentialLP:
             previous_basis = self.saved_basis
             rhs_update, capacities = self._update_rhs(snapshot)
             restored = False
-            if mode == "explicit_basis" and previous_basis is not None:
+            if mode in {"explicit_basis", "explicit_basis_presolve"} and previous_basis is not None:
                 vbasis, cbasis = previous_basis
                 self.model.setAttr("VBasis", self.variables, vbasis)
                 all_constraints = self.capacity_constraints + self.demand_constraints + self.availability_constraints
@@ -365,10 +390,10 @@ class GurobiSequentialLP:
             list(self.model.getAttr("VBasis", self.variables)),
             list(self.model.getAttr("CBasis", all_constraints)),
         )
-        if mode == "reuse_model":
+        if mode in {"reuse_model", "reuse_model_auto"}:
             api = "MODEL_REUSE_RHS_UPDATE_GUROBI_INTERNAL_BASIS_RETENTION"
             effective = had_previous_solution
-        elif mode == "explicit_basis":
+        elif mode in {"explicit_basis", "explicit_basis_presolve"}:
             api = "GETATTR_SETATTR_VBASIS_CBASIS"
             effective = restored
         elif mode == "reset_basis":
@@ -386,6 +411,9 @@ class GurobiSequentialLP:
             mode=mode,
             warm_start_api=api,
             warm_start_effective=effective,
+            method=int(self.model.Params.Method),
+            presolve=int(self.model.Params.Presolve),
+            lp_warm_start=int(self.model.Params.LPWarmStart),
             model_build=model_build,
             rhs_update=rhs_update,
             optimize_wall=optimize_wall,
@@ -407,6 +435,7 @@ class GurobiSequentialLP:
 def _assemble_state(
     *, snapshot: Snapshot, universe: LPUniverse, backend: str, backend_version: str,
     status: str, mode: SolveMode, warm_start_api: str, warm_start_effective: bool,
+    method: int | None, presolve: int | None, lp_warm_start: int | None,
     model_build: float, rhs_update: float, optimize_wall: float, total_wall: float,
     solver_runtime: float | None, iter_count: float | None, path_values: np.ndarray,
     capacities: Mapping[EdgeKey, float], raw_capacity_pi: np.ndarray,
@@ -458,6 +487,7 @@ def _assemble_state(
         position=snapshot.position, data_idx=snapshot.data_idx, backend=backend,
         backend_version=backend_version, status=status, solve_mode=mode,
         warm_start_api=warm_start_api, warm_start_effective=warm_start_effective,
+        method=method, presolve=presolve, lp_warm_start=lp_warm_start,
         model_build_wall_time=model_build, rhs_update_wall_time=rhs_update,
         optimize_wall_time=optimize_wall, total_wall_time=total_wall,
         solver_runtime=solver_runtime, iter_count=iter_count,
@@ -542,7 +572,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--backend", choices=("auto", "gurobi", "scipy"), default="auto")
     parser.add_argument("--allow-scipy-fallback", action="store_true")
-    parser.add_argument("--mode", choices=("cold_rebuild", "reuse_model", "explicit_basis", "reset_basis"), default="cold_rebuild")
+    parser.add_argument(
+        "--mode",
+        choices=("cold_rebuild", "reuse_model", "reuse_model_auto", "explicit_basis", "explicit_basis_presolve", "reset_basis"),
+        default="cold_rebuild",
+    )
     parser.add_argument("--network-edge-capacity", type=float, default=200.0)
     parser.add_argument("--path-only-edge-capacity", type=float, default=800.0)
     parser.add_argument("--output-dir", default="output/temporal_feasibility")

@@ -69,6 +69,7 @@ class Snapshot:
     paths: frozenset[PathKey]
     timestamp: str | None
     source_keys: tuple[str, ...]
+    meta: Mapping[str, Any]
 
     @property
     def total_demand(self) -> float:
@@ -139,8 +140,20 @@ def snapshot_from_mapping(sample: Mapping[str, Any], position: int) -> Snapshot:
     path_edges = {edge for key in paths for edge in path_edges_for_key(key)}
     edges.update(path_edges)
 
-    timestamp_keys = ("timestamp", "time", "datetime", "epoch", "ephemeris_time")
-    timestamp = next((str(sample[key]) for key in timestamp_keys if key in sample), None)
+    raw_meta = sample.get("meta", {})
+    if raw_meta is None:
+        raw_meta = {}
+    if not isinstance(raw_meta, Mapping):
+        raise DatasetFormatError(f"Sample {position} meta must be a mapping when present")
+    meta = {str(key): value for key, value in raw_meta.items()}
+    timestamp_keys = ("source_timestamp", "timestamp", "time", "datetime", "epoch", "ephemeris_time")
+    timestamp = next(
+        (
+            str(container[key]) for container in (meta, sample) for key in timestamp_keys
+            if key in container and container[key] is not None and container[key] != ""
+        ),
+        None,
+    )
     return Snapshot(
         position=position,
         data_idx=sample["data_idx"],
@@ -151,6 +164,7 @@ def snapshot_from_mapping(sample: Mapping[str, Any], position: int) -> Snapshot:
         paths=frozenset(paths),
         timestamp=timestamp,
         source_keys=tuple(sorted(str(key) for key in sample.keys())),
+        meta=meta,
     )
 
 
@@ -165,7 +179,9 @@ def path_edges_for_key(path_key: PathKey) -> tuple[EdgeKey, ...]:
     return tuple(zip(nodes[:-1], nodes[1:]))
 
 
-def load_dataset(path: str | Path, limit: int | None = None) -> list[Snapshot]:
+def load_dataset(
+    path: str | Path, limit: int | None = None, start_index: int = 0
+) -> list[Snapshot]:
     """Load and validate an adapter-generated pickle while preserving list order."""
 
     dataset_path = Path(path)
@@ -177,12 +193,16 @@ def load_dataset(path: str | Path, limit: int | None = None) -> list[Snapshot]:
         raise DatasetFormatError(
             f"Expected a list-of-dict pickle, got {type(raw).__name__}: {dataset_path}"
         )
+    if start_index < 0:
+        raise ValueError("--start-index must be non-negative")
     if limit is not None:
         if limit <= 0:
             raise ValueError("--limit must be positive")
-        raw = raw[:limit]
+        raw = raw[start_index:start_index + limit]
+    else:
+        raw = raw[start_index:]
     snapshots = []
-    for position, sample in enumerate(raw):
+    for position, sample in enumerate(raw, start=start_index):
         if not isinstance(sample, Mapping):
             raise DatasetFormatError(f"Sample {position} is not a mapping")
         snapshots.append(snapshot_from_mapping(sample, position))

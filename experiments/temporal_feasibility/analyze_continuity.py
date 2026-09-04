@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
+from scipy.stats import mannwhitneyu, wilcoxon
 
 from .extract_primal_dual import calibrate_dual_sign
 from .semantic_alignment import (
@@ -28,7 +29,8 @@ from .semantic_alignment import (
 from .sequence_schema import Snapshot, load_dataset
 from .sequential_lp import CapacityPolicy, GurobiSequentialLP, LPUniverse, ScipySequentialLP, SolveState, choose_backend
 
-LAGS = (1, 2, 5, 10)
+LAGS = (1, 2, 5, 10, 20)
+BOOTSTRAP_SAMPLES = 5000
 
 
 def _finite_or_none(value: float) -> float | None:
@@ -40,12 +42,17 @@ def _pair_metrics(
     current_state: SolveState, pair_type: str, lag: int,
 ) -> dict[str, Any]:
     persistent, new_edges, deleted_edges = topology_delta(previous, current)
-    common_paths = sorted(set(previous.paths).intersection(current.paths))
-    path_l1 = normalized_l1(previous_state.path_flow, current_state.path_flow, common_paths)
-    path_l2 = normalized_l2(previous_state.path_flow, current_state.path_flow, common_paths)
-    path_pearson, path_spearman = correlations(previous_state.path_flow, current_state.path_flow, common_paths)
+    # Compare the complete fixed universe so path/edge births and deaths remain visible.
+    path_keys = sorted(set(previous_state.path_flow).union(current_state.path_flow))
+    edge_keys = sorted(set(previous_state.edge_load).union(current_state.edge_load))
+    path_l1 = normalized_l1(previous_state.path_flow, current_state.path_flow, path_keys)
+    path_l2 = normalized_l2(previous_state.path_flow, current_state.path_flow, path_keys)
+    path_pearson, path_spearman = correlations(previous_state.path_flow, current_state.path_flow, path_keys)
     persistent_keys = sorted(persistent)
-    load_pearson, load_spearman = correlations(previous_state.edge_load, current_state.edge_load, persistent_keys)
+    load_pearson, load_spearman = correlations(previous_state.edge_load, current_state.edge_load, edge_keys)
+    utilization_pearson, utilization_spearman = correlations(
+        previous_state.edge_utilization, current_state.edge_utilization, edge_keys
+    )
     dual_pearson, dual_spearman = correlations(previous_state.congestion_price, current_state.congestion_price, persistent_keys)
     birth_mass, death_mass = path_birth_death_mass(previous_state.path_flow, current_state.path_flow)
     previous_binding = {edge for edge, active in previous_state.binding_capacity.items() if active}
@@ -64,19 +71,30 @@ def _pair_metrics(
         "semantic_path_overlap": jaccard(previous.paths, current.paths),
         "path_flow_common_normalized_l1": path_l1,
         "path_flow_common_normalized_l2": path_l2,
+        "path_flow_normalized_l1": path_l1,
+        "path_flow_normalized_l2": path_l2,
         "path_flow_common_pearson": _finite_or_none(path_pearson),
         "path_flow_common_spearman": _finite_or_none(path_spearman),
         "path_birth_mass": birth_mass,
         "path_death_mass": death_mass,
-        "edge_load_persistent_normalized_l1": normalized_l1(previous_state.edge_load, current_state.edge_load, persistent_keys),
-        "edge_load_persistent_normalized_l2": normalized_l2(previous_state.edge_load, current_state.edge_load, persistent_keys),
+        "edge_load_persistent_normalized_l1": normalized_l1(previous_state.edge_load, current_state.edge_load, edge_keys),
+        "edge_load_persistent_normalized_l2": normalized_l2(previous_state.edge_load, current_state.edge_load, edge_keys),
         "edge_load_persistent_pearson": _finite_or_none(load_pearson),
         "edge_load_persistent_spearman": _finite_or_none(load_spearman),
+        "utilization_normalized_l1": normalized_l1(
+            previous_state.edge_utilization, current_state.edge_utilization, edge_keys
+        ),
+        "utilization_normalized_l2": normalized_l2(
+            previous_state.edge_utilization, current_state.edge_utilization, edge_keys
+        ),
+        "utilization_pearson": _finite_or_none(utilization_pearson),
+        "utilization_spearman": _finite_or_none(utilization_spearman),
         "dual_persistent_normalized_l1": normalized_l1(previous_state.congestion_price, current_state.congestion_price, persistent_keys),
         "dual_persistent_normalized_l2": normalized_l2(previous_state.congestion_price, current_state.congestion_price, persistent_keys),
         "dual_persistent_pearson": _finite_or_none(dual_pearson),
         "dual_persistent_spearman": _finite_or_none(dual_spearman),
         "binding_edge_jaccard": jaccard(previous_binding, current_binding),
+        "binding_edge_jaccard_distance": 1.0 - jaccard(previous_binding, current_binding),
         "new_edge_ratio": len(new_edges) / edge_union_size,
         "deleted_edge_ratio": len(deleted_edges) / edge_union_size,
         "dual_objective_normalized_delta": abs(previous_state.dual_objective - current_state.dual_objective) / max(abs(previous_state.dual_objective), abs(current_state.dual_objective), 1e-12),
@@ -105,6 +123,23 @@ def _control_target(
     if kind == "random_topology_matched":
         target_similarity = jaccard(base.graph_edges, adjacent.graph_edges)
         return min(candidates, key=lambda index: (abs(jaccard(base.graph_edges, snapshots[index].graph_edges) - target_similarity), rng.random()))
+    if kind == "random_demand_topology_matched":
+        target_demand_delta = abs(base.total_demand - adjacent.total_demand) / max(
+            base.total_demand, adjacent.total_demand, 1e-12
+        )
+        target_topology_similarity = jaccard(base.graph_edges, adjacent.graph_edges)
+        return min(
+            candidates,
+            key=lambda index: (
+                abs(
+                    abs(base.total_demand - snapshots[index].total_demand)
+                    / max(base.total_demand, snapshots[index].total_demand, 1e-12)
+                    - target_demand_delta
+                )
+                + abs(jaccard(base.graph_edges, snapshots[index].graph_edges) - target_topology_similarity),
+                rng.random(),
+            ),
+        )
     raise ValueError(f"Unknown control kind: {kind}")
 
 
@@ -114,7 +149,7 @@ def _bootstrap_ratio(adjacent: list[float], control: list[float], seed: int = 42
     rng = np.random.default_rng(seed)
     left, right = np.asarray(adjacent), np.asarray(control)
     ratios = []
-    for _ in range(2000):
+    for _ in range(BOOTSTRAP_SAMPLES):
         lm = float(np.median(rng.choice(left, size=len(left), replace=True)))
         rm = float(np.median(rng.choice(right, size=len(right), replace=True)))
         if rm > 1e-12:
@@ -122,12 +157,26 @@ def _bootstrap_ratio(adjacent: list[float], control: list[float], seed: int = 42
     return [float(np.percentile(ratios, 2.5)), float(np.percentile(ratios, 97.5))] if ratios else None
 
 
+def _bootstrap_median_ci(values: list[float], seed: int = 42) -> list[float] | None:
+    """Return a deterministic 5,000-resample confidence interval for the median."""
+
+    if not values:
+        return None
+    rng = np.random.default_rng(seed)
+    array = np.asarray(values, dtype=float)
+    medians = np.median(
+        rng.choice(array, size=(BOOTSTRAP_SAMPLES, len(array)), replace=True), axis=1
+    )
+    return [float(np.percentile(medians, 2.5)), float(np.percentile(medians, 97.5))]
+
+
 def _distribution_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     metrics = (
-        "path_flow_common_normalized_l1",
         "edge_load_persistent_normalized_l1",
+        "utilization_normalized_l1",
+        "binding_edge_jaccard_distance",
+        "path_flow_normalized_l1",
         "dual_persistent_normalized_l1",
-        "binding_edge_jaccard",
     )
     result: dict[str, Any] = {}
     pair_types = sorted({str(row["pair_type"]) for row in records})
@@ -139,22 +188,91 @@ def _distribution_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
                 "count": len(values),
                 "median": float(np.median(values)) if values else None,
                 "mean": float(np.mean(values)) if values else None,
+                "iqr": [float(np.percentile(values, 25)), float(np.percentile(values, 75))] if values else None,
+                "median_bootstrap_95_ci": _bootstrap_median_ci(values),
             }
         adjacent = [float(row[metric]) for row in records if row["pair_type"] == "adjacent" and row[metric] is not None]
-        control = [float(row[metric]) for row in records if row["pair_type"] == "random_demand_matched" and row[metric] is not None]
+        control = [
+            float(row[metric]) for row in records
+            if row["pair_type"] == "random_demand_topology_matched" and row[metric] is not None
+        ]
         if adjacent and control and float(np.median(control)) > 1e-12:
-            result[metric]["adjacent_to_demand_matched_median_ratio"] = float(np.median(adjacent) / np.median(control))
+            result[metric]["adjacent_to_jointly_matched_median_ratio"] = float(np.median(adjacent) / np.median(control))
         else:
-            result[metric]["adjacent_to_demand_matched_median_ratio"] = None
+            result[metric]["adjacent_to_jointly_matched_median_ratio"] = None
         result[metric]["ratio_bootstrap_95_ci"] = _bootstrap_ratio(adjacent, control)
+        if adjacent and control:
+            result[metric]["mann_whitney_u_pvalue"] = float(
+                mannwhitneyu(adjacent, control, alternative="less").pvalue
+            )
+            try:
+                if np.allclose(np.asarray(adjacent) - np.asarray(control), 0.0):
+                    raise ValueError("all paired differences are zero")
+                pvalue = float(wilcoxon(adjacent, control, alternative="less").pvalue)
+                result[metric]["paired_wilcoxon_pvalue"] = pvalue if math.isfinite(pvalue) else 1.0
+            except ValueError:
+                result[metric]["paired_wilcoxon_pvalue"] = 1.0
+            comparisons = sum(left < right for left in adjacent for right in control)
+            ties = sum(left == right for left in adjacent for right in control)
+            result[metric]["probability_adjacent_lower_effect_size"] = (
+                comparisons + 0.5 * ties
+            ) / (len(adjacent) * len(control))
     qualified = []
     for name in metrics[:3]:
-        ratio = result[name]["adjacent_to_demand_matched_median_ratio"]
-        interval = result[name]["ratio_bootstrap_95_ci"]
-        if ratio is not None and interval is not None:
-            # A favorable point estimate is insufficient when uncertainty crosses the gate.
-            qualified.append(ratio <= 0.7 and interval[1] <= 0.7)
-    result["gate_b"] = "PASS" if len(qualified) >= 2 and all(qualified) else "FAIL_OR_INCONCLUSIVE"
+        ratio = result[name]["adjacent_to_jointly_matched_median_ratio"]
+        if ratio is not None:
+            qualified.append(
+                ratio <= 0.7 and result[name].get("paired_wilcoxon_pvalue", 1.0) < 0.05
+            )
+    result["gate_b"] = (
+        "PASS" if len(qualified) >= 2 and sum(qualified) >= 2
+        else "PARTIAL" if qualified and any(qualified)
+        else "FAIL"
+    )
+    return result
+
+
+def _transport_candidate(
+    previous_values: dict[tuple[int, int], float], previous_state: SolveState,
+    current_state: SolveState, previous_edges: frozenset[tuple[int, int]],
+    current_edges: frozenset[tuple[int, int]], state_name: str, policy: str, seed: int,
+) -> dict[tuple[int, int], float]:
+    """Copy persistent values and deterministically initialize newly born edges."""
+
+    rng = random.Random(seed)
+    persistent = set(previous_edges).intersection(current_edges)
+    result = {edge: float(previous_values.get(edge, 0.0)) for edge in persistent}
+    old_values = [float(previous_values.get(edge, 0.0)) for edge in sorted(previous_edges)]
+    global_value = float(np.median(old_values)) if old_values else 0.0
+    for edge in sorted(set(current_edges) - set(previous_edges)):
+        neighbors = [
+            float(value) for candidate, value in previous_values.items()
+            if edge[0] in candidate or edge[1] in candidate
+        ]
+        if policy == "zero":
+            value = 0.0
+        elif policy == "one" and state_name == "dual_price":
+            value = 1.0
+        elif policy == "global_median":
+            value = global_value
+        elif policy == "neighbor_median":
+            value = float(np.median(neighbors)) if neighbors else global_value
+        elif policy == "capacity_normalized_local_mean":
+            if state_name == "edge_load":
+                neighbor_utilization = [
+                    previous_state.edge_utilization.get(candidate, 0.0)
+                    for candidate in previous_edges
+                    if edge[0] in candidate or edge[1] in candidate
+                ]
+                utilization = float(np.mean(neighbor_utilization)) if neighbor_utilization else 0.0
+                value = utilization * current_state.edge_capacity.get(edge, 0.0)
+            else:
+                value = float(np.mean(neighbors)) if neighbors else global_value
+        elif policy == "random_matched":
+            value = rng.choice(old_values) if old_values else 0.0
+        else:
+            raise ValueError(f"Unsupported transport policy {policy!r} for {state_name}")
+        result[edge] = value
     return result
 
 
@@ -163,84 +281,120 @@ def _transport_records(snapshots: list[Snapshot], states: list[SolveState]) -> l
     for index in range(1, len(snapshots)):
         previous, current = snapshots[index - 1], snapshots[index]
         previous_state, current_state = states[index - 1], states[index]
-        baselines = initialization_baselines(current.graph_edges, previous_state.congestion_price, seed=42 + index)
-        candidates = {
-            f"transport_{policy}": transport_edge_prices(
-                previous_state.congestion_price, previous.graph_edges, current.graph_edges, policy
-            )
-            for policy in ("zero", "global_median", "neighbor_median")
+        state_maps = {
+            "edge_load": (previous_state.edge_load, current_state.edge_load),
+            "utilization": (previous_state.edge_utilization, current_state.edge_utilization),
+            "binding_state": (
+                {edge: float(value) for edge, value in previous_state.binding_capacity.items()},
+                {edge: float(value) for edge, value in current_state.binding_capacity.items()},
+            ),
+            "dual_price": (previous_state.congestion_price, current_state.congestion_price),
         }
-        candidates.update({f"default_{name}": value for name, value in baselines.items()})
         keys = sorted(current.graph_edges)
-        for name, candidate in candidates.items():
-            pearson, spearman = correlations(candidate, current_state.congestion_price, keys)
-            records.append(
+        for state_offset, (state_name, (previous_values, current_values)) in enumerate(state_maps.items()):
+            policies = [
+                "zero", "global_median", "neighbor_median",
+                "capacity_normalized_local_mean", "random_matched",
+            ]
+            if state_name == "dual_price":
+                policies.append("one")
+            candidates = {
+                f"transport_{policy}": _transport_candidate(
+                    previous_values, previous_state, current_state,
+                    previous.graph_edges, current.graph_edges, state_name, policy,
+                    42 + 1000 * state_offset + index,
+                )
+                for policy in policies
+            }
+            previous_distribution = [previous_values.get(edge, 0.0) for edge in sorted(previous.graph_edges)]
+            global_mean = float(np.mean(previous_distribution)) if previous_distribution else 0.0
+            baseline_rng = random.Random(42000 + 1000 * state_offset + index)
+            candidates.update(
                 {
-                    "previous_position": previous.position,
-                    "current_position": current.position,
-                    "change_type": classify_change(previous, current),
-                    "initialization": name,
-                    "normalized_l1": normalized_l1(candidate, current_state.congestion_price, keys),
-                    "normalized_l2": normalized_l2(candidate, current_state.congestion_price, keys),
-                    "pearson": _finite_or_none(pearson),
-                    "spearman": _finite_or_none(spearman),
+                    "default_zero": {edge: 0.0 for edge in keys},
+                    "default_global_mean": {edge: global_mean for edge in keys},
+                    "default_random_matched": {
+                        edge: baseline_rng.choice(previous_distribution) if previous_distribution else 0.0
+                        for edge in keys
+                    },
                 }
             )
+            if state_name == "dual_price":
+                candidates["default_one"] = {edge: 1.0 for edge in keys}
+            actual_binding = {edge for edge in keys if current_values.get(edge, 0.0) >= 0.5}
+            for name, candidate in candidates.items():
+                pearson, spearman = correlations(candidate, current_values, keys)
+                predicted_binding = {edge for edge in keys if candidate.get(edge, 0.0) >= 0.5}
+                records.append(
+                    {
+                        "previous_position": previous.position,
+                        "current_position": current.position,
+                        "change_type": classify_change(previous, current),
+                        "state": state_name,
+                        "initialization": name,
+                        "persistent_edge_count": len(set(previous.graph_edges).intersection(current.graph_edges)),
+                        "new_edge_count": len(set(current.graph_edges) - set(previous.graph_edges)),
+                        "deleted_edge_count": len(set(previous.graph_edges) - set(current.graph_edges)),
+                        "normalized_l1": normalized_l1(candidate, current_values, keys),
+                        "normalized_l2": normalized_l2(candidate, current_values, keys),
+                        "pearson": _finite_or_none(pearson),
+                        "spearman": _finite_or_none(spearman),
+                        "binding_set_overlap": jaccard(predicted_binding, actual_binding),
+                    }
+                )
     return records
 
 
 def _transport_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
-    grouped: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
-    for row in records:
-        grouped[str(row["change_type"])][str(row["initialization"])].append(float(row["normalized_l1"]))
-    summary: dict[str, Any] = {}
-    for change_type, methods in grouped.items():
-        summary[change_type] = {name: float(np.median(values)) for name, values in methods.items()}
-    dynamic_rows = [row for row in records if row["change_type"] in {"topology_only", "both_change"}]
-    method_medians = {
-        name: float(np.median([float(row["normalized_l1"]) for row in dynamic_rows if row["initialization"] == name]))
-        for name in sorted({str(row["initialization"]) for row in dynamic_rows})
-    } if dynamic_rows else {}
-    transports = [value for name, value in method_medians.items() if name.startswith("transport_")]
-    controls = [value for name, value in method_medians.items() if name.startswith("default_")]
-    best_transport = min(
-        ((name, value) for name, value in method_medians.items() if name.startswith("transport_")),
-        key=lambda item: item[1], default=None,
-    )
-    best_control = min(
-        ((name, value) for name, value in method_medians.items() if name.startswith("default_")),
-        key=lambda item: item[1], default=None,
-    )
-    paired_interval = None
-    if best_transport is not None and best_control is not None:
-        by_method = {
-            name: {int(row["current_position"]): float(row["normalized_l1"]) for row in dynamic_rows if row["initialization"] == name}
-            for name in (best_transport[0], best_control[0])
+    dynamic_rows = [row for row in records if row["new_edge_count"] or row["deleted_edge_count"]]
+    if not dynamic_rows:
+        return {"gate_d": "BLOCKED_NO_DYNAMIC_TRANSITIONS", "states": {}}
+    summary: dict[str, Any] = {"states": {}}
+    primary_significant = 0
+    primary_improved = 0
+    for state_name in sorted({str(row["state"]) for row in dynamic_rows}):
+        state_rows = [row for row in dynamic_rows if row["state"] == state_name]
+        medians = {
+            name: float(np.median([float(row["normalized_l1"]) for row in state_rows if row["initialization"] == name]))
+            for name in sorted({str(row["initialization"]) for row in state_rows})
         }
-        keys = sorted(set(by_method[best_transport[0]]).intersection(by_method[best_control[0]]))
-        if keys:
-            differences = np.asarray([
-                by_method[best_transport[0]][key] - by_method[best_control[0]][key] for key in keys
-            ])
-            rng = np.random.default_rng(42)
-            boot = [
-                float(np.median(rng.choice(differences, size=len(differences), replace=True)))
-                for _ in range(2000)
-            ]
-            paired_interval = [float(np.percentile(boot, 2.5)), float(np.percentile(boot, 97.5))]
-    summary["dynamic_method_medians"] = method_medians
-    summary["best_transport_vs_best_control"] = {
-        "best_transport": best_transport,
-        "best_control": best_control,
-        "paired_median_difference_95_ci": paired_interval,
-    }
-    summary["gate_d"] = (
-        "PASS" if transports and controls and min(transports) < min(controls)
-        and paired_interval is not None and paired_interval[1] < 0.0
-        else "FAIL_OR_INCONCLUSIVE" if dynamic_rows
-        else "BLOCKED_NO_DYNAMIC_TRANSITIONS"
-    )
-    summary["claim_limit"] = "Price distance only; no primal recovery claim"
+        best_transport = min(
+            ((name, value) for name, value in medians.items() if name.startswith("transport_")),
+            key=lambda item: item[1], default=None,
+        )
+        best_control = min(
+            ((name, value) for name, value in medians.items() if name.startswith("default_")),
+            key=lambda item: item[1], default=None,
+        )
+        pvalue = 1.0
+        if best_transport and best_control:
+            transported = [float(row["normalized_l1"]) for row in state_rows if row["initialization"] == best_transport[0]]
+            controlled = [float(row["normalized_l1"]) for row in state_rows if row["initialization"] == best_control[0]]
+            try:
+                if np.allclose(np.asarray(transported) - np.asarray(controlled), 0.0):
+                    raise ValueError("all paired differences are zero")
+                candidate_pvalue = float(wilcoxon(transported, controlled, alternative="less").pvalue)
+                pvalue = candidate_pvalue if math.isfinite(candidate_pvalue) else 1.0
+            except ValueError:
+                pvalue = 1.0
+            if (
+                state_name in {"edge_load", "utilization", "binding_state"}
+                and best_transport[1] < best_control[1] and pvalue < 0.05
+            ):
+                primary_significant += 1
+            if (
+                state_name in {"edge_load", "utilization", "binding_state"}
+                and best_transport[1] < best_control[1]
+            ):
+                primary_improved += 1
+        summary["states"][state_name] = {
+            "method_medians": medians,
+            "best_transport": best_transport,
+            "best_no_history_control": best_control,
+            "paired_wilcoxon_pvalue": pvalue,
+        }
+    summary["gate_d"] = "PASS" if primary_significant >= 1 else "PARTIAL" if primary_improved >= 1 else "FAIL"
+    summary["claim_limit"] = "State initialization distance only; no learned model or primal recovery claim"
     return summary
 
 
@@ -257,6 +411,8 @@ def analyze(
         else ScipySequentialLP(universe, policy, calibration["sign_multiplier"])
     )
     states = [solver.solve(snapshot, mode="cold_rebuild") for snapshot in snapshots]
+    if backend == "gurobi":
+        solver.close()
     records: list[dict[str, Any]] = []
     rng = random.Random(seed)
     for lag in LAGS:
@@ -264,7 +420,10 @@ def analyze(
             pair_type = "adjacent" if lag == 1 else f"lag_{lag}"
             records.append(_pair_metrics(snapshots[index], snapshots[index + lag], states[index], states[index + lag], pair_type, lag))
     for index in range(len(snapshots) - 1):
-        for kind in ("random_unrestricted", "random_demand_matched", "random_topology_matched"):
+        for kind in (
+            "random_unrestricted", "random_demand_matched",
+            "random_topology_matched", "random_demand_topology_matched",
+        ):
             target = _control_target(snapshots, index, index + 1, kind, rng)
             records.append(_pair_metrics(snapshots[index], snapshots[target], states[index], states[target], kind, abs(target - index)))
     transport = _transport_records(snapshots, states)

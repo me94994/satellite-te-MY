@@ -24,7 +24,13 @@ from .sequential_lp import (
     choose_backend,
 )
 
-MODES: tuple[SolveMode, ...] = ("cold_rebuild", "reuse_model", "explicit_basis")
+MODES: tuple[SolveMode, ...] = (
+    "cold_rebuild",
+    "reuse_model_auto",
+    "explicit_basis",
+    "explicit_basis_presolve",
+    "reset_basis",
+)
 
 
 def _windows(snapshots: list[Snapshot], window_size: int, stride: int) -> list[list[Snapshot]]:
@@ -92,6 +98,7 @@ def _summarize(records: list[dict[str, Any]], backend: str) -> dict[str, Any]:
             "sample_count_excluding_first": len(rows),
             "optimize_time": {
                 "median": statistics.median(optimize) if optimize else None,
+                "p50": _percentile(optimize, 50),
                 "mean": statistics.mean(optimize) if optimize else None,
                 "p90": _percentile(optimize, 90),
                 "p95": _percentile(optimize, 95),
@@ -100,29 +107,57 @@ def _summarize(records: list[dict[str, Any]], backend: str) -> dict[str, Any]:
             },
             "total_time": {
                 "median": statistics.median(total) if total else None,
+                "p50": _percentile(total, 50),
                 "mean": statistics.mean(total) if total else None,
                 "p90": _percentile(total, 90),
                 "p95": _percentile(total, 95),
                 "p99": _percentile(total, 99),
             },
-            "iter_count_median": statistics.median(iterations) if iterations else None,
+            "iter_count": {
+                "median": statistics.median(iterations) if iterations else None,
+                "mean": statistics.mean(iterations) if iterations else None,
+                "p50": _percentile(iterations, 50),
+                "p90": _percentile(iterations, 90),
+                "p95": _percentile(iterations, 95),
+                "p99": _percentile(iterations, 99),
+            },
         }
     cold = summary["modes"]["cold_rebuild"]["optimize_time"]["median"]
     reductions: dict[str, float | None] = {}
     reduction_intervals: dict[str, list[float] | None] = {}
-    for mode in ("reuse_model", "explicit_basis"):
+    speedups: dict[str, float | None] = {}
+    total_speedups: dict[str, float | None] = {}
+    iteration_reductions: dict[str, float | None] = {}
+    cold_iterations = summary["modes"]["cold_rebuild"]["iter_count"]["median"]
+    for mode in MODES[1:]:
         warm = summary["modes"][mode]["optimize_time"]["median"]
         reductions[mode] = None if cold in (None, 0) or warm is None else 1.0 - warm / cold
+        speedups[mode] = None if warm in (None, 0) or cold is None else cold / warm
+        cold_total = summary["modes"]["cold_rebuild"]["total_time"]["median"]
+        warm_total = summary["modes"][mode]["total_time"]["median"]
+        total_speedups[mode] = (
+            None if warm_total in (None, 0) or cold_total is None else cold_total / warm_total
+        )
         reduction_intervals[mode] = _paired_reduction_ci(records, mode)
+        warm_iterations = summary["modes"][mode]["iter_count"]["median"]
+        iteration_reductions[mode] = (
+            None if cold_iterations in (None, 0) or warm_iterations is None
+            else 1.0 - warm_iterations / cold_iterations
+        )
     summary["median_optimize_time_reduction_vs_cold"] = reductions
+    summary["median_paired_speedup_vs_cold"] = speedups
+    summary["median_total_time_speedup_vs_cold"] = total_speedups
+    summary["median_iteration_reduction_vs_cold"] = iteration_reductions
     summary["paired_bootstrap_reduction_95_ci"] = reduction_intervals
     qualified = [
         value >= 0.20 and reduction_intervals[mode] is not None and reduction_intervals[mode][0] > 0.0
         for mode, value in reductions.items() if value is not None
     ]
+    best_speedup = max((value for value in speedups.values() if value is not None), default=None)
     summary["gate_c"] = (
-        "PASS" if backend == "gurobi" and any(qualified)
-        else "FAIL" if backend == "gurobi"
+        "STRONG_WARM_START" if backend == "gurobi" and best_speedup is not None and best_speedup >= 5.0
+        else "MODERATE_WARM_START" if backend == "gurobi" and best_speedup is not None and best_speedup >= 1.25
+        else "WEAK_WARM_START" if backend == "gurobi"
         else "BLOCKED_NO_GUROBI_FORMAL_BENCHMARK"
     )
     return summary
@@ -146,6 +181,8 @@ def benchmark(
             else:
                 solver = ScipySequentialLP(universe, policy, calibration["sign_multiplier"])
             states_by_mode[mode] = [solver.solve(snapshot, mode=mode) for snapshot in window]
+            if backend == "gurobi":
+                solver.close()
         for local_index, snapshot in enumerate(window):
             cold = states_by_mode["cold_rebuild"][local_index]
             for mode in MODES:

@@ -12,7 +12,7 @@ from lib.data.starlink import StarlinkAdapter, StarlinkMixAdapter, StarlinkReduc
 ARG_TOPO_FILE_TEMPLATE = 'StarLink_DataSetForAgent{}_5000_{}.pkl'
 FILE_VOLUME = ['A']
 ARG_DATA_PER_TOPO = 200
-ARG_PARALLEL = None
+ARG_PARALLEL = 1
 # ====================================
 
 parser = argparse.ArgumentParser()
@@ -25,6 +25,8 @@ parser.add_argument('--reduced', type=int)
 parser.add_argument('--teal_form', action="store_true")
 parser.add_argument('--harp_form', action="store_true")
 parser.add_argument('--data-per-topo', type=int, default=ARG_DATA_PER_TOPO)
+parser.add_argument('--start-index', type=int, default=0)
+parser.add_argument('--limit', type=int)
 
 parser.add_argument('--inter-shell-mode', type=str, required=True)
 parser.add_argument('--parallel', type=int, default=ARG_PARALLEL)
@@ -108,7 +110,10 @@ else:
             file_volume=FILE_VOLUME,
             data_per_topo=args.data_per_topo,
             ism=args.ism,
-            parallel=args.parallel
+            parallel=args.parallel,
+            start_index=args.start_index,
+            limit=args.limit,
+            intensity=int(args.intensity),
         ).adapt(output_path)
     else:
         output_path = os.path.join(args.output_path, args.prefix, args.inter_shell_mode)
