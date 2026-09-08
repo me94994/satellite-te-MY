@@ -86,6 +86,14 @@ class BenchmarkInstance:
             "topology_hash": _digest([list(e) for e in sorted(self.physical_edges)]),
         }
 
+    def shared_input_hashes(self) -> Dict[str, str]:
+        """Hash K-independent inputs for a paired K=5/K=10 comparison."""
+        return {
+            "demand_hash": _digest([[*p, self.demands.get(p, 0.0)] for p in self.all_pairs]),
+            "capacity_hash": _digest([[*e, self.capacities[e]] for e in sorted(self.physical_edges)]),
+            "topology_hash": _digest([list(e) for e in sorted(self.physical_edges)]),
+        }
+
     def paths_for_k(self, k: int) -> "BenchmarkInstance":
         """Select only existing paths; never manufacture or duplicate paths."""
         if k <= 0:
@@ -160,6 +168,19 @@ def assert_same_problem(*instances: BenchmarkInstance) -> None:
     expected = instances[0].hashes()
     if any(instance.hashes() != expected for instance in instances[1:]):
         raise AssertionError("SAME PROBLEM INSTANCE gate failed")
+
+
+def assert_k5_prefix_of_k10(k5: BenchmarkInstance, k10: BenchmarkInstance) -> None:
+    """Enforce a genuine paired path experiment with P5 as a strict P10 prefix."""
+    if k5.shared_input_hashes() != k10.shared_input_hashes():
+        raise AssertionError("paired K inputs differ outside candidate path count")
+    if set(k5.candidate_paths) != set(k10.candidate_paths):
+        raise AssertionError("paired K path-pair universes differ")
+    for pair in k10.candidate_paths:
+        if len(k5.candidate_paths[pair]) != 5 or len(k10.candidate_paths[pair]) != 10:
+            raise AssertionError("paired experiment requires exactly K=5 and K=10")
+        if k5.candidate_paths[pair] != k10.candidate_paths[pair][:5]:
+            raise AssertionError("K=5 paths are not the first five K=10 paths")
 
 
 def topology_pruning_accounting(full_count: int, representative_count: int, per_label_s: float) -> Dict[str, float]:

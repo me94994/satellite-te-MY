@@ -123,6 +123,7 @@ def build_model(instance: BenchmarkInstance, level: str, method: int = -1, threa
     model.Params.Threads = threads
     model.Params.Presolve = cfg["presolve"]
     model.Params.Method = method
+    model.Params.Seed = 42
     variables = {}
     for pair, index, path in path_rows:
         variable = model.addVar(lb=0.0, name=f"x_{pair[0]}_{pair[1]}_{index}")
@@ -157,9 +158,12 @@ def solve_level(instance: BenchmarkInstance, level: str, limits: SafetyLimits, m
         return {"level": level, "status": str(exc).splitlines()[0], **estimate}
     before = {"num_vars": model.NumVars, "num_constraints": model.NumConstrs, "num_nonzeros": model.NumNZs}
     presolved = {"presolved_vars": "NOT_AVAILABLE", "presolved_constraints": "NOT_AVAILABLE", "presolved_nonzeros": "NOT_AVAILABLE"}
+    presolve_probe_s = 0.0
     if LEVELS[level]["presolve"] != 0 and hasattr(model, "presolve"):
         try:
+            presolve_start = time.perf_counter()
             pm = model.presolve()
+            presolve_probe_s = time.perf_counter() - presolve_start
             presolved = {"presolved_vars": pm.NumVars, "presolved_constraints": pm.NumConstrs, "presolved_nonzeros": pm.NumNZs}
             pm.dispose()
         except Exception:
@@ -169,6 +173,19 @@ def solve_level(instance: BenchmarkInstance, level: str, limits: SafetyLimits, m
     optimize_wall_s = time.perf_counter() - start
     gp = _load_gurobi()
     ok = model.Status == gp.GRB.OPTIMAL
+    edge_loads = {edge: 0.0 for edge in instance.active_path_edges}
+    if ok:
+        # The returned variable keys are the exact dense/sparse model universe.
+        for (pair, index), variable in variables.items():
+            value = variable.X
+            for edge in zip(instance.candidate_paths[pair][index][:-1], instance.candidate_paths[pair][index][1:]):
+                if edge in edge_loads:
+                    edge_loads[edge] += value
+    binding_edges = sum(
+        abs(edge_loads[edge] - instance.capacities[edge]) <= 1e-7 * max(1.0, instance.capacities[edge])
+        for edge in edge_loads
+    ) if ok else None
+    total_demand = sum(instance.demands.get(pair, 0.0) for pair in instance.active_pairs)
     result = {
         "snapshot_id": instance.snapshot_id,
         "evidence_label": instance.evidence_label,
@@ -176,9 +193,15 @@ def solve_level(instance: BenchmarkInstance, level: str, limits: SafetyLimits, m
         "status": "MEASURED" if ok else f"GUROBI_STATUS_{model.Status}",
         **instance.hashes(), **estimate, **before, **presolved, **timing,
         "optimize_wall_s": optimize_wall_s,
+        "presolve_probe_s": presolve_probe_s,
         "gurobi_runtime_s": model.Runtime,
         "total_s": timing["parse_s"] + timing["build_s"] + optimize_wall_s,
         "objective": model.ObjVal if ok else None,
+        "total_demand": total_demand,
+        "unsatisfied_demand": total_demand - model.ObjVal if ok else None,
+        "binding_edges": binding_edges,
+        "binding_edge_ratio": binding_edges / len(edge_loads) if ok and edge_loads else 0.0,
+        "iter_count": model.IterCount if ok else None,
         "num_active_flows": len(instance.active_pairs),
         "num_all_flows": len(instance.all_pairs),
         "num_paths": len(variables),

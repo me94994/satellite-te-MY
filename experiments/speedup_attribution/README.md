@@ -20,3 +20,15 @@ python -m experiments.speedup_attribution.run_all
 
 Outputs are incremental under `output/speedup_attribution/`, which is ignored
 by Git. Dense construction is guarded before Gurobi objects are allocated.
+
+The K=10 large-scale extension is also sequential and single-process:
+
+```bash
+python -m experiments.speedup_attribution.run_large_scale
+```
+
+It keeps `MEASURED`, `MEASURED_FIT`, `PAPER_REPORTED_REFERENCE`, and
+`EXTRAPOLATED_4236` as separate evidence classes. Its generated topology and
+stress regimes are diagnostics, never paper-workload substitutes. Use
+`--resume` to retain completed JSONL points or `--quick` for a protocol smoke
+run; the formal defaults preserve the preregistered scale and repeat counts.
