@@ -397,11 +397,13 @@ def generate_unique_paths(
     for src, dst in sorted(set(pairs)):
         cache_path = None
         raw_paths = None
+        cache_lookup_start = time.perf_counter()
         if cache_dir is not None:
             cache_path = cache_dir / f"{path_cache_key(topo_digest, _mode_name(mode), src, dst, requested_k)}.pkl"
             if cache_path.is_file():
                 with cache_path.open("rb") as handle:
                     raw_paths = pickle.load(handle)
+        cache_lookup_s = time.perf_counter() - cache_lookup_start
         cache_hit = raw_paths is not None
         generation_start = time.perf_counter()
         if raw_paths is None:
@@ -420,17 +422,20 @@ def generate_unique_paths(
             "returned_paths": len(raw_paths), "unique_paths": len(unique),
             "status": "COMPLETE" if len(unique) == requested_k else "K10_PATH_SHORTFALL",
             "cache_hit": cache_hit,
+            # 分开记录 cached 输入与真正的 path generation，避免输入语义混淆。
+            "path_cache_lookup_s": cache_lookup_s,
             "path_generation_uncached_s": 0.0 if cache_hit else time.perf_counter() - generation_start,
         })
     return result, audit
 
 
-def build_official_instance(
-    record: Mapping[str, Any], provenance: SnapshotProvenance,
-    capacity: CapacityConfiguration, mode: Any = None, cache_dir: Path | None = None,
-) -> tuple[OfficialBenchmarkInstance, list[dict[str, Any]]]:
-    demands, _ = aggregate_flowset(record["FlowSet"])
-    satellite_paths, audit = generate_unique_paths(record, demands, 10, mode, cache_dir)
+def assemble_official_instance(
+    provenance: SnapshotProvenance, capacity: CapacityConfiguration,
+    demands: Mapping[Pair, float], satellite_paths: Mapping[Pair, tuple[TEPath, ...]],
+    audit: Sequence[Mapping[str, Any]], mode: Any = None,
+) -> OfficialBenchmarkInstance:
+    """从已聚合 demand 和已生成 path 创建 canonical instance，供分阶段计时。"""
+
     sat2user = _satellite_to_user(mode)
     user_node_floor = int(sat2user(0))
     # 完整 TE path 必须包含 source-user uplink 与 destination-user downlink。
@@ -460,13 +465,22 @@ def build_official_instance(
     hashes = benchmark.hashes()
     hops = [len(path) - 1 for values in paths.values() for path in values]
     complete = sum(item["unique_paths"] == 10 for item in audit)
-    official = OfficialBenchmarkInstance(
+    return OfficialBenchmarkInstance(
         provenance=provenance, benchmark=benchmark, requested_k=10,
         topology_hash=hashes["topology_hash"], demand_hash=hashes["demand_hash"],
         path_hash=hashes["path_hash"], unique_path_completion_rate=complete / len(audit) if audit else 0.0,
         mean_path_hops=statistics.fmean(hops), p95_path_hops=percentile(hops, 0.95),
         user_node_floor=user_node_floor,
     )
+
+
+def build_official_instance(
+    record: Mapping[str, Any], provenance: SnapshotProvenance,
+    capacity: CapacityConfiguration, mode: Any = None, cache_dir: Path | None = None,
+) -> tuple[OfficialBenchmarkInstance, list[dict[str, Any]]]:
+    demands, _ = aggregate_flowset(record["FlowSet"])
+    satellite_paths, audit = generate_unique_paths(record, demands, 10, mode, cache_dir)
+    official = assemble_official_instance(provenance, capacity, demands, satellite_paths, audit, mode)
     return official, audit
 
 
