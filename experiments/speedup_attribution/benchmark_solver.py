@@ -174,10 +174,13 @@ def solve_level(instance: BenchmarkInstance, level: str, limits: SafetyLimits, m
     gp = _load_gurobi()
     ok = model.Status == gp.GRB.OPTIMAL
     edge_loads = {edge: 0.0 for edge in instance.active_path_edges}
+    flow_loads = {pair: 0.0 for pair in instance.active_pairs}
     if ok:
         # The returned variable keys are the exact dense/sparse model universe.
         for (pair, index), variable in variables.items():
             value = variable.X
+            if pair in flow_loads:
+                flow_loads[pair] += value
             for edge in zip(instance.candidate_paths[pair][index][:-1], instance.candidate_paths[pair][index][1:]):
                 if edge in edge_loads:
                     edge_loads[edge] += value
@@ -197,6 +200,13 @@ def solve_level(instance: BenchmarkInstance, level: str, limits: SafetyLimits, m
         "gurobi_runtime_s": model.Runtime,
         "total_s": timing["parse_s"] + timing["build_s"] + optimize_wall_s,
         "objective": model.ObjVal if ok else None,
+        # 显式记录可行性供 AMPL parity 硬门槛使用，避免只比较 objective。
+        "max_capacity_violation": max(
+            (edge_loads[edge] - instance.capacities[edge] for edge in edge_loads), default=0.0
+        ) if ok else None,
+        "max_demand_violation": max(
+            (flow_loads[pair] - instance.demands[pair] for pair in flow_loads), default=0.0
+        ) if ok else None,
         "total_demand": total_demand,
         "unsatisfied_demand": total_demand - model.ObjVal if ok else None,
         "binding_edges": binding_edges,
