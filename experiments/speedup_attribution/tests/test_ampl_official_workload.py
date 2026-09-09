@@ -8,6 +8,7 @@ from pathlib import Path
 import pickle
 import subprocess
 from types import SimpleNamespace
+import zipfile
 
 import pytest
 
@@ -15,10 +16,10 @@ from experiments.speedup_attribution import ampl_environment as env
 from experiments.speedup_attribution import ampl_solver
 from experiments.speedup_attribution import official_workload as official
 from experiments.speedup_attribution.ampl_solver import (
-    CODE_PUBLIC_CONFIG, PAPER_LIKE_CONFIG, SolverBackend, parity_check, sparse_rows,
+    CODE_PUBLIC_CONFIG, PAPER_LIKE_CONFIG, SolverBackend, ThreadMode, parity_check, sparse_rows,
 )
 from experiments.speedup_attribution.benchmark_solver import diagnostic_instance
-from experiments.speedup_attribution.run_ampl_full_scale import append_status
+from experiments.speedup_attribution.run_ampl_full_scale import append_status, run_solve_process
 from experiments.speedup_attribution.schemas import assert_k5_prefix_of_k10
 
 
@@ -200,7 +201,20 @@ def test_raw_cache_and_license_paths_are_ignored():
 def test_inventory_reports_all_missing_volumes(tmp_path):
     inventory = official.build_inventory([tmp_path])
     assert inventory["status"] == "BENCHMARK_INCOMPLETE"
+    assert inventory["BENCHMARK_PRIMARY_READY"] is False
     assert len(inventory["missing_files"]) == 8
+
+
+def test_primary_one_volume_ready_and_missing_b_does_not_block(tmp_path):
+    path = tmp_path / "DataSetForSaTE100" / "StarLink_DataSetForAgent100_5000_A.pkl"
+    path.parent.mkdir()
+    with path.open("wb") as handle:
+        pickle.dump(raw_record(), handle)
+    inventory = official.build_inventory([tmp_path])
+    assert inventory["status"] == "BENCHMARK_PRIMARY_READY"
+    assert inventory["BENCHMARK_PRIMARY_READY"] is True
+    assert inventory["BENCHMARK_ALL_INTENSITIES_READY"] is False
+    assert inventory["BENCHMARK_A_B_COMPLETE"] is False
 
 
 def test_inventory_requires_all_three_benchmark_fields(tmp_path):
@@ -218,10 +232,85 @@ def test_distribution_and_nominal_k10_math():
     assert 10 * stats["P95"] == 480
 
 
-def test_threads_above_one_are_rejected():
-    result = diagnostic_instance(nodes=16, active_flows=2, k=5)
-    with pytest.raises(ValueError, match="ONLY_SINGLE_THREAD_ALLOWED"):
-        ampl_solver.solve_ampl_gurobi(result, threads=24)
+def test_download_archive_validity(tmp_path):
+    archive = tmp_path / "DataSetForSaTE100.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("DataSetForSaTE100/StarLink_DataSetForAgent100_5000_A.pkl", b"data")
+    assert official.inspect_download_archive(archive)["status"] == "DOWNLOAD_ARCHIVE_VALID"
+    invalid = tmp_path / "quota.html"
+    invalid.write_text("<html>quota exceeded</html>")
+    assert official.inspect_download_archive(invalid)["status"] == "DOWNLOAD_ARCHIVE_INVALID"
+
+
+def test_access_user_nodes_and_capacity_values(monkeypatch):
+    monkeypatch.setattr(official, "_satellite_to_user", lambda mode: lambda sat: sat + official.SATELLITE_COUNT)
+    monkeypatch.setattr(official, "SPG", SimpleNamespace(SPOnGrid=lambda src, dst, *_: [
+        [src, 100 + index, dst] for index in range(10)
+    ]))
+    provenance = official.SnapshotProvenance("DataSetForSaTE100", "A", "raw.pkl", 0, 3, 2, 11.0)
+    paper, audit = official.build_official_instance(raw_record(), provenance, PAPER_LIKE_CONFIG)
+    code = paper.with_capacity(CODE_PUBLIC_CONFIG)
+    access = [edge for edge in paper.benchmark.physical_edges if max(edge) >= official.SATELLITE_COUNT]
+    assert access
+    assert {paper.benchmark.capacities[edge] for edge in access} == {50.0}
+    assert {code.benchmark.capacities[edge] for edge in access} == {800.0}
+    assert paper.hashes() == code.hashes()
+    assert paper.benchmark.candidate_paths[(4236, 4239)][0][0] == 4236
+    assert paper.benchmark.candidate_paths[(4236, 4239)][0][-1] == 4239
+    assert all(item["unique_paths"] == 10 for item in audit)
+
+
+def test_grdstation_uses_official_user_offset_for_access_classification(monkeypatch):
+    monkeypatch.setattr(official, "_satellite_to_user", lambda mode: lambda sat: sat + 4236 + 222)
+    monkeypatch.setattr(official, "SPG", SimpleNamespace(SPOnGrid=lambda src, dst, *_: [
+        [src, 4300, 100 + index, dst] for index in range(10)
+    ]))
+    provenance = official.SnapshotProvenance("DataSetForSaTE100", "A", "raw.pkl", 0, 3, 2, 11.0)
+    instance, _ = official.build_official_instance(raw_record(), provenance, PAPER_LIKE_CONFIG, mode="GrdStation")
+    assert instance.user_node_floor == 4458
+    assert instance.benchmark.capacities[(0, 4300)] == 200.0
+    assert instance.benchmark.capacities[(4458, 0)] == 50.0
+
+
+def test_path_cache_key_stability_and_provenance():
+    key = official.path_cache_key("topology", "ISL", 1, 2, 10)
+    assert key == official.path_cache_key("topology", "ISL", 1, 2, 10)
+    assert key != official.path_cache_key("other", "ISL", 1, 2, 10)
+    assert set(official.SnapshotProvenance.__dataclass_fields__) >= {
+        "dataset", "volume", "source_path", "record_index", "raw_flow_count", "active_sd_pairs", "total_demand"
+    }
+
+
+def test_thread_modes_declared_without_forcing_default():
+    source = inspect.getsource(ampl_solver.solve_ampl_gurobi)
+    assert {item.value for item in ThreadMode} == {
+        "GUROBI_DEFAULT", "GUROBI_THREADS_1", "GUROBI_THREADS_24"
+    }
+    assert 'options = "outlev=0"' in source
+    assert 'options += " threads=1"' in source
+    assert 'options += " threads=24"' in source
+
+
+def test_child_process_timeout_is_incremental(monkeypatch, tmp_path):
+    monkeypatch.setattr("experiments.speedup_attribution.run_ampl_full_scale.OUTPUT_ROOT", tmp_path)
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired("x", 1)))
+    result = run_solve_process(tmp_path / "job.pkl", tmp_path / "result.json", ThreadMode.DEFAULT, timeout_s=1)
+    assert result["status"] == "TIMEOUT"
+    statuses = [json.loads(line)["status"] for line in (tmp_path / "solve_status.jsonl").read_text().splitlines()]
+    assert statuses == ["STARTED", "TIMEOUT"]
+
+
+def test_no_flow_or_active_sd_cap_in_official_pipeline():
+    source = inspect.getsource(official.build_official_instance)
+    assert "[:180]" not in source and "min(180" not in source
+
+
+def test_sate_masks_shortfalls_without_fake_k10_or_self_pair_drop():
+    source = Path("experiments/speedup_attribution/benchmark_k10.py").read_text(encoding="utf-8-sig")
+    env_source = Path("lib/spaceTE/sate_env.py").read_text(encoding="utf-8")
+    assert "INACTIVE_MASK_NO_FAKE_DUPLICATES" in source
+    assert "active_path_mask" in env_source
+    assert "filtered_tm = dict(data['tm'])" in env_source
 
 
 def test_no_paper_reference_is_stored_as_measurement():

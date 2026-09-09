@@ -72,6 +72,8 @@ def make_sate_env(
     dataset: Optional[Sequence[Mapping[str, object]]] = None,
     penalized: bool = False,
     work_dir: str = "output/speedup_attribution/large_scale",
+    network_capacity: float = 200.0,
+    access_capacity: float = 800.0,
 ) -> SaTEEnv:
     """Use the production SaTE environment under an explicit CODE_CONFIG orbit shape."""
     data = _to_sate_data(instance, topology_nodes)
@@ -80,9 +82,9 @@ def make_sate_env(
         GrdStationNum=0,
         Offset5=topology_nodes,
         graph_node_num=topology_nodes * 2,
-        isl_cap=200,
-        uplink_cap=800,
-        downlink_cap=800,
+        isl_cap=network_capacity,
+        uplink_cap=access_capacity,
+        downlink_cap=access_capacity,
         ism=ISM.ISL,
     )
     return SaTEEnv(
@@ -143,11 +145,19 @@ def benchmark_instance(
     checkpoint_label: str,
     warmup: int,
     repeats: int,
+    network_capacity: float = 200.0,
+    access_capacity: float = 800.0,
 ) -> Dict[str, object]:
     """Measure graph construction, both GNNs, repair, e2e, memory, and quality."""
     if not torch.cuda.is_available():
         return {"status": "BLOCKED_CUDA_NOT_AVAILABLE", "topology_nodes": topology_nodes, "k": k}
-    env = make_sate_env(instance, topology_nodes, k)
+    if any(len(instance.candidate_paths[pair]) > k for pair in instance.active_pairs):
+        return {"status": "REJECTED_PATH_COUNT_EXCEEDS_K", "topology_nodes": topology_nodes, "k": k}
+    inactive_slots = sum(k - len(instance.candidate_paths[pair]) for pair in instance.active_pairs)
+    env = make_sate_env(
+        instance, topology_nodes, k,
+        network_capacity=network_capacity, access_capacity=access_capacity,
+    )
     env.reset("test")
     torch.manual_seed(42)
     actor = SaTEActor(env, "EdgeGAT", 0, "linear", "k10-crossover", torch.device("cuda:0"))
@@ -227,6 +237,11 @@ def benchmark_instance(
         "hashes": instance.hashes(),
         "warmup": warmup,
         "repeats": repeats,
+        "network_capacity": network_capacity,
+        "access_capacity": access_capacity,
+        "path_slot_policy": "INACTIVE_MASK_NO_FAKE_DUPLICATES",
+        "actual_unique_path_nodes": sum(len(instance.candidate_paths[pair]) for pair in instance.active_pairs),
+        "inactive_path_slots": inactive_slots,
         "t_input_graph": _summary(input_times),
         "t_topognn": _summary(topo_times),
         "t_allognn": _summary(allo_times),

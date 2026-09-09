@@ -44,12 +44,16 @@ class BenchmarkInstance:
         if any(not math.isfinite(v) or v < 0 for v in self.capacities.values()):
             raise ValueError("capacities must be finite and non-negative")
         for pair, demand in self.demands.items():
-            if pair[0] == pair[1] or not set(pair) <= node_set:
+            # Official SaTE aggregation can map two users attached to one satellite to the
+            # same aggregate user node; its access-up/access-down path is still a valid cycle.
+            if not set(pair) <= node_set:
                 raise ValueError(f"invalid demand pair: {pair}")
             if not math.isfinite(demand) or demand < 0:
                 raise ValueError(f"invalid demand for {pair}")
         for pair, paths in self.candidate_paths.items():
-            if pair[0] == pair[1] or not set(pair) <= node_set:
+            # Official SaTE aggregation can map two users attached to one satellite to the
+            # same aggregate user node; its access-up/access-down path is still a valid cycle.
+            if not set(pair) <= node_set:
                 raise ValueError(f"invalid path pair: {pair}")
             if len(paths) != len(set(paths)):
                 raise ValueError(f"duplicate candidate path for {pair}")
@@ -150,7 +154,6 @@ def estimate_lp(instance: BenchmarkInstance, level: str) -> Dict[str, float]:
         "estimated_nonzeros": nonzeros,
         "estimated_memory_gb": estimated_bytes / 1e9,
     }
-
 
 def enforce_safety(estimate: Mapping[str, float], limits: SafetyLimits) -> None:
     if (

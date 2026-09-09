@@ -125,7 +125,9 @@ class SaTEEnv(object):
         data = self.dataset[self.idx]
 
         # sort the traffic matrix by src, dst
-        filtered_tm = {k: v for k, v in data['tm'].items() if k.split(', ')[0] != k.split(', ')[1]}
+        # Official raw workload contains same-satellite aggregate flows. Keep them;
+        # their explicit access-up/access-down cycle is part of the canonical instance.
+        filtered_tm = dict(data['tm'])
 
         sorted_tm = sorted(
             filtered_tm.items(),
@@ -389,6 +391,10 @@ class SaTEEnv(object):
             num_round_iter: number of rounds when iteratively cutting flow
         """
 
+        # Missing official K10 paths are inactive architecture slots, never duplicated paths.
+        if hasattr(self, 'active_path_mask'):
+            action = action * self.active_path_mask
+
         if self.dummy_path:
             demand = self.obs['traffic'][::self.num_path+1]
         else:
@@ -428,7 +434,8 @@ class SaTEEnv(object):
                 # util = edge_flow/capacity
                 # propotionally cut path flow by max util
                 util = torch_scatter.scatter(
-                    util[self.p2e[1]], self.p2e[0], reduce="max")
+                    util[self.p2e[1]], self.p2e[0],
+                    dim_size=self.num_path_node, reduce="max").clamp(min=1)
                 path_flow_allocated = path_flow/util
                 # update total allocation, residual capacity, residual flow
                 path_flow_allocated_total += path_flow_allocated
@@ -659,9 +666,14 @@ class SaTEEnv(object):
         src_list, dst_list = [], []
 
         path_values = [0] * self.num_path_node
+        active_path_values = [0] * self.num_path_node
         for (src, dst) in zip(self.src, self.dst):
             configured_paths = paths.get(f'{src}, {dst}', [])
-            flow_use_path[0] += [flow_count] * len(configured_paths)
+            if len(configured_paths) > num_path:
+                raise ValueError("OFFICIAL_PATH_COUNT_EXCEEDS_REQUESTED_K")
+            # All K architecture slots connect to the flow; slots without a real path
+            # remain isolated from links and are forced to zero by active_path_mask.
+            flow_use_path[0] += [flow_count] * num_path
             # index = self.num_path * ((self.G.number_of_nodes() - 1) * src + dst) if src > dst \
             #     else self.num_path * ((self.G.number_of_nodes() - 1) * src + dst - 1)
             index = flow_count * num_path
@@ -670,6 +682,7 @@ class SaTEEnv(object):
 
             for i, path in enumerate(configured_paths):
                 path_values[index+i] = len(path)
+                active_path_values[index+i] = 1
                 path_i = index + i
 
                 for (u, v) in zip(path[:-1], path[1:]):
@@ -692,6 +705,7 @@ class SaTEEnv(object):
         p2e = torch.tensor([src_list, dst_list], dtype=torch.long).to(self.device)
         p2e[0] -= edge_num
         self.p2e = p2e
+        self.active_path_mask = torch.tensor(active_path_values, dtype=torch.float32).to(self.device)
         e2p = torch.tensor([dst_list, src_list], dtype=torch.long).to(self.device)
         e2p[1] -= edge_num
 

@@ -18,6 +18,14 @@ class SolverBackend(str, Enum):
     AMPL_GUROBI = "AMPL_GUROBI"
 
 
+class ThreadMode(str, Enum):
+    """显式区分论文主比较与第二轮单线程衔接。"""
+
+    DEFAULT = "GUROBI_DEFAULT"
+    THREADS_1 = "GUROBI_THREADS_1"
+    THREADS_24 = "GUROBI_THREADS_24"
+
+
 @dataclass(frozen=True)
 class CapacityConfiguration:
     name: str
@@ -80,15 +88,17 @@ def _set_parameter(parameter: Any, values: Mapping[int, float]) -> None:
     parameter.setValues(dict(values))
 
 
-def solve_ampl_gurobi(instance: BenchmarkInstance, threads: int = 1) -> dict[str, Any]:
+def solve_ampl_gurobi(
+    instance: BenchmarkInstance, thread_mode: ThreadMode = ThreadMode.DEFAULT,
+    solver_name: str = "gurobi",
+) -> dict[str, Any]:
     """在内存中定义/载入 sparse AMPL 模型并返回可比求解证据。"""
 
-    if threads != 1:
-        raise ValueError("ONLY_SINGLE_THREAD_ALLOWED")
+    thread_mode = ThreadMode(thread_mode)
     try:
         from amplpy import AMPL
     except Exception as exc:
-        return {"backend": SolverBackend.AMPL_GUROBI.value, "status": "FAILED", "failure_type": type(exc).__name__}
+        return {"backend": f"AMPL_{solver_name.upper()}", "status": "FAILED", "failure_type": type(exc).__name__}
 
     rows = sparse_rows(instance)
     ampl = None
@@ -112,12 +122,21 @@ def solve_ampl_gurobi(instance: BenchmarkInstance, threads: int = 1) -> dict[str
         })
         data_load_s = time.perf_counter() - load_start
 
-        ampl.setOption("gurobi_options", "outlev=0 threads=1")
+        options = "outlev=0"
+        if thread_mode is ThreadMode.THREADS_1:
+            options += " threads=1"
+        elif thread_mode is ThreadMode.THREADS_24:
+            options += " threads=24"
+        # DEFAULT 刻意不传 threads，让 Gurobi 使用安装环境默认策略。
+        if solver_name != "gurobi":
+            # Cross-check solver 固定单线程，避免把并行差异混入 objective parity。
+            options = "outlev=0 threads=1"
+        ampl.setOption(f"{solver_name}_options", options)
         solve_start = time.perf_counter()
-        ampl.solve(solver="gurobi", verbose=False)
+        ampl.solve(solver=solver_name, verbose=False)
         solve_wall_s = time.perf_counter() - solve_start
         if str(ampl.getValue("solve_result")) != "solved":
-            return {"backend": SolverBackend.AMPL_GUROBI.value, "status": "FAILED", "failure_type": "SOLVE_NOT_OPTIMAL"}
+            return {"backend": f"AMPL_{solver_name.upper()}", "status": "FAILED", "failure_type": "SOLVE_NOT_OPTIMAL"}
 
         extract_start = time.perf_counter()
         values = ampl.getVariable("x").getValues().toDict()
@@ -135,7 +154,7 @@ def solve_ampl_gurobi(instance: BenchmarkInstance, threads: int = 1) -> dict[str
         binding = sum(abs(edge_loads[e] - instance.capacities[e]) <= 1e-7 * max(1.0, instance.capacities[e]) for e in edge_loads)
         total_demand = sum(instance.demands[p] for p in rows["flows"])
         return {
-            "backend": SolverBackend.AMPL_GUROBI.value,
+            "backend": f"AMPL_{solver_name.upper()}",
             "status": "MEASURED",
             **instance.hashes(),
             **estimate_lp(instance, "L4"),
@@ -156,11 +175,12 @@ def solve_ampl_gurobi(instance: BenchmarkInstance, threads: int = 1) -> dict[str
             "T_gurobi_reported_runtime": "GUROBI_INTERNAL_RUNTIME_NOT_AVAILABLE",
             "presolve_post_size": "PRESOLVE_POST_SIZE_NOT_AVAILABLE",
             "iter_count": "NOT_AVAILABLE",
-            "threads": 1,
+            "thread_mode": thread_mode.value,
+            "threads": {ThreadMode.DEFAULT: "DEFAULT", ThreadMode.THREADS_1: 1, ThreadMode.THREADS_24: 24}[thread_mode],
         }
     except Exception as exc:
         # 只保留异常类型，AMPL 原始文本可能包含许可证内容。
-        return {"backend": SolverBackend.AMPL_GUROBI.value, "status": "FAILED", "failure_type": type(exc).__name__}
+        return {"backend": f"AMPL_{solver_name.upper()}", "status": "FAILED", "failure_type": type(exc).__name__}
     finally:
         if ampl is not None:
             try:
